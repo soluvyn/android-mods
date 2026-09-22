@@ -44,7 +44,7 @@ jobs:
       - name: Build ${{ matrix.module.name }}
         working-directory: ${{ matrix.module.path }}
         env:
-          NDK: ${{ ANDROID_HOME }}/ndk/26.3.11579264
+          NDK: $ANDROID_HOME/ndk/26.3.11579264
         run: |
           set -e
 
