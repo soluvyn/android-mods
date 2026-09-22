@@ -1,343 +1,200 @@
 #include <jni.h>
-#include <pthread.h>
 #include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
-#include <sys/types.h>
-
 #include "zygisk.h"
 
-typedef struct {
-    jclass clazz; // Global reference
-    jfieldID secureContentPolicyField; // cached mSecureContentPolicy field ID, or NULL
-    jfieldID captureSecureLayersField; // cached mCaptureSecureLayers field ID, or NULL
-} CachedClass;
+#define N(x) (sizeof(x) / sizeof(*(x)))
+#define SECURE 0x80
 
-#define MAX_CACHED_CLASSES 16
-static CachedClass g_cached_classes[MAX_CACHED_CLASSES];
-static int g_cached_classes_count = 0;
-static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define SURFACE_SECURE 0x80
+static JNIEnv *env;
+static struct zygisk_api_table *api;
+static bool registered;
 
-static JavaVM *g_jvm = NULL;
-static struct zygisk_api_table *g_api_table = NULL;
-static bool hooks_registered = false;
+typedef jint (*cap_d)(JNIEnv*,jclass,jobject,jlong);
+typedef jint (*cap_o)(JNIEnv*,jclass,jobject,jobject);
+typedef jint (*cap_s)(JNIEnv*,jclass,jobject,jlong,jboolean);
+typedef jobject (*create_d)(JNIEnv*,jclass,jstring,jboolean);
+typedef void (*flags)(JNIEnv*,jclass,jobject,jobject,jint,jint);
+typedef void (*flags_j)(JNIEnv*,jclass,jlong,jint,jint);
+typedef void (*flags_t)(JNIEnv*,jclass,jlong,jlong,jint,jint);
 
-// Target package name for FLAG_SECURE modification (set at runtime from args)
-static char g_target_package[256] = {0};
-static bool g_target_package_set = false;
+static cap_d od, odi, od_sc, ol, oli, ol_sc;
+static cap_o oo, oo_sc, olo, olo_sc;
+static cap_s os, osi, os_sc;
+static create_d ocd, ocv;
+static flags of;
+static flags_j of_old;
+static flags_t oft;
 
-typedef jint (*nativeCaptureDisplay_long_t)(JNIEnv *, jclass, jobject, jlong);
-static nativeCaptureDisplay_long_t orig_nativeCaptureDisplay_long = NULL;
-static nativeCaptureDisplay_long_t orig_nativeCaptureDisplayInternal_long = NULL;
-static nativeCaptureDisplay_long_t orig_nativeCaptureDisplay_sc_long = NULL;
+static jfieldID d_policy, d_layers;
+static jfieldID l_policy, l_layers;
+static jfieldID sd_policy, sd_layers;
 
-typedef jint (*nativeCaptureDisplay_obj_t)(JNIEnv *, jclass, jobject, jobject);
-static nativeCaptureDisplay_obj_t orig_nativeCaptureDisplay_obj = NULL;
-static nativeCaptureDisplay_obj_t orig_nativeCaptureDisplay_sc_obj = NULL;
+static void secure(JNIEnv *e, jobject o, jfieldID policy, jfieldID layers) {
+    if (!o) return;
 
-typedef jint (*nativeCaptureLayers_long_sync_t)(JNIEnv *, jclass, jobject, jlong, jboolean);
-static nativeCaptureLayers_long_sync_t orig_nativeCaptureLayers_long_sync = NULL;
-static nativeCaptureLayers_long_sync_t orig_nativeCaptureLayersInternal_long_sync = NULL;
-static nativeCaptureLayers_long_sync_t orig_nativeCaptureLayers_sc_long_sync = NULL;
+    if (policy)
+        (*e)->SetIntField(e, o, policy, 1);
+    else if (layers)
+        (*e)->SetBooleanField(e, o, layers, JNI_TRUE);
 
-typedef jint (*nativeCaptureLayers_long_t)(JNIEnv *, jclass, jobject, jlong);
-static nativeCaptureLayers_long_t orig_nativeCaptureLayers_long = NULL;
-static nativeCaptureLayers_long_t orig_nativeCaptureLayersInternal_long = NULL;
-static nativeCaptureLayers_long_t orig_nativeCaptureLayers_sc_long = NULL;
-
-typedef jint (*nativeCaptureLayers_obj_t)(JNIEnv *, jclass, jobject, jobject);
-static nativeCaptureLayers_obj_t orig_nativeCaptureLayers_obj = NULL;
-static nativeCaptureLayers_obj_t orig_nativeCaptureLayers_sc_obj = NULL;
-
-typedef jobject (*nativeCreateDisplay_t)(JNIEnv *, jclass, jstring, jboolean);
-static nativeCreateDisplay_t orig_nativeCreateDisplay = NULL;
-
-typedef jobject (*nativeCreateVirtualDisplay_t)(JNIEnv *, jclass, jstring, jboolean);
-static nativeCreateVirtualDisplay_t orig_nativeCreateVirtualDisplay = NULL;
-
-// Correct signature: (Landroid/view/SurfaceControl$Transaction;Landroid/view/SurfaceControl;II)V
-typedef void (*nativeSetFlags_t)(JNIEnv *, jclass, jobject, jobject, jint, jint);
-static nativeSetFlags_t orig_nativeSetFlags = NULL;
-
-// Old signature: (JII)V
-typedef void (*nativeSetFlags_old_t)(JNIEnv *, jclass, jlong, jint, jint);
-static nativeSetFlags_old_t orig_nativeSetFlags_old = NULL;
-
-static JNIEnv *get_env() {
-    JNIEnv *env = NULL;
-    if (g_jvm == NULL) return NULL;
-    jint res = (*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6);
-    if (res == JNI_EDETACHED) {
-        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
-            return NULL;
-        }
-    }
-    return env;
+    if ((*e)->ExceptionCheck(e))
+        (*e)->ExceptionClear(e);
 }
 
-// Macro to reduce boilerplate for hooks that call force_secure_capture then original
-#define HOOK_SECURE_CAPTURE(return_type, hook_name, orig_name, ...) \
-    static return_type hook_name(JNIEnv *env, jclass clazz, jobject captureArgs, ##__VA_ARGS__) { \
-        force_secure_capture(env, captureArgs); \
-        return orig_name(env, clazz, captureArgs, ##__VA_ARGS__); \
-    }
-
-static void force_secure_capture(JNIEnv *env, jobject captureArgs) {
-    if (captureArgs == NULL) return;
-    
-    // Check if we should apply FLAG_SECURE modification for this process
-    if (g_target_package_set) {
-        // Get the calling package name and compare
-        // In practice, we'd need to get the package name from the captureArgs or context
-        // For now, we apply it globally but log a warning - this should be restricted to target packages
-    }
-
-    jclass captureArgsClass = (*env)->GetObjectClass(env, captureArgs);
-    if (captureArgsClass == NULL) return;
-
-    jfieldID secureContentPolicyField = NULL;
-    jfieldID captureSecureLayersField = NULL;
-    bool found = false;
-
-    pthread_mutex_lock(&g_cache_mutex);
-    for (int i = 0; i < g_cached_classes_count; i++) {
-        if ((*env)->IsSameObject(env, g_cached_classes[i].clazz, captureArgsClass)) {
-            secureContentPolicyField = g_cached_classes[i].secureContentPolicyField;
-            captureSecureLayersField = g_cached_classes[i].captureSecureLayersField;
-            found = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_cache_mutex);
-
-    if (!found) {
-        (*env)->ExceptionClear(env);
-
-        secureContentPolicyField = (*env)->GetFieldID(env, captureArgsClass, "mSecureContentPolicy", "I");
-        if (secureContentPolicyField == NULL) {
-            (*env)->ExceptionClear(env);
-            captureSecureLayersField = (*env)->GetFieldID(env, captureArgsClass, "mCaptureSecureLayers", "Z");
-            if (captureSecureLayersField == NULL) {
-                (*env)->ExceptionClear(env);
-            }
-        }
-
-        if (g_cached_classes_count < MAX_CACHED_CLASSES) {
-            jclass globalClass = (*env)->NewGlobalRef(env, captureArgsClass);
-            if (globalClass != NULL) {
-                pthread_mutex_lock(&g_cache_mutex);
-                if (g_cached_classes_count < MAX_CACHED_CLASSES) {
-                    g_cached_classes[g_cached_classes_count].clazz = globalClass;
-                    g_cached_classes[g_cached_classes_count].secureContentPolicyField = secureContentPolicyField;
-                    g_cached_classes[g_cached_classes_count].captureSecureLayersField = captureSecureLayersField;
-                    g_cached_classes_count++;
-                } else {
-                    (*env)->DeleteGlobalRef(env, globalClass);
-                }
-                pthread_mutex_unlock(&g_cache_mutex);
-            }
-        }
-    }
-
-    if (secureContentPolicyField != NULL) {
-        (*env)->SetIntField(env, captureArgs, secureContentPolicyField, 1);
-        if ((*env)->ExceptionCheck(env)) {
-            (*env)->ExceptionClear(env);
-        }
-    } else if (captureSecureLayersField != NULL) {
-        (*env)->SetBooleanField(env, captureArgs, captureSecureLayersField, JNI_TRUE);
-        if ((*env)->ExceptionCheck(env)) {
-            (*env)->ExceptionClear(env);
-        }
-    }
-
-    (*env)->DeleteLocalRef(env, captureArgsClass);
+#define CAP(name, orig, p, l, ...)                              \
+static jint name(JNIEnv *e,jclass c,jobject a,##__VA_ARGS__) { \
+    secure(e,a,p,l);                                            \
+    return orig ? orig(e,c,a,##__VA_ARGS__) : JNI_ERR;         \
 }
 
-// Generate all hook functions using macro
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureDisplay_long, orig_nativeCaptureDisplay_long, jlong consumeBufferInterfacePtr)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureDisplayInternal_long, orig_nativeCaptureDisplayInternal_long, jlong consumeBufferInterfacePtr)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureDisplay_sc_long, orig_nativeCaptureDisplay_sc_long, jlong consumeBufferInterfacePtr)
+CAP(h_d,   od,    d_policy,d_layers,jlong x)
+CAP(h_di,  odi,   l_policy,l_layers,jlong x)
+CAP(h_ds,  od_sc, sd_policy,sd_layers,jlong x)
+CAP(h_do,  oo,    d_policy,d_layers,jobject x)
+CAP(h_dso, oo_sc, sd_policy,sd_layers,jobject x)
 
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureDisplay_obj, orig_nativeCaptureDisplay_obj, jobject listener)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureDisplay_sc_obj, orig_nativeCaptureDisplay_sc_obj, jobject listener)
+CAP(h_l,   ol,    d_policy,d_layers,jlong x)
+CAP(h_li,  oli,   l_policy,l_layers,jlong x)
+CAP(h_ls,  ol_sc, sd_policy,sd_layers,jlong x)
+CAP(h_lo,  olo,   d_policy,d_layers,jobject x)
+CAP(h_lso, olo_sc, sd_policy,sd_layers,jobject x)
 
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_long_sync, orig_nativeCaptureLayers_long_sync, jlong consumeBufferInterfacePtr, jboolean sync)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayersInternal_long_sync, orig_nativeCaptureLayersInternal_long_sync, jlong consumeBufferInterfacePtr, jboolean sync)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_sc_long_sync, orig_nativeCaptureLayers_sc_long_sync, jlong consumeBufferInterfacePtr, jboolean sync)
+CAP(h_s,   os,    d_policy,d_layers,jlong x,jboolean s)
+CAP(h_si,  osi,   l_policy,l_layers,jlong x,jboolean s)
+CAP(h_ss,  os_sc, sd_policy,sd_layers,jlong x,jboolean s)
 
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_long, orig_nativeCaptureLayers_long, jlong consumeBufferInterfacePtr)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayersInternal_long, orig_nativeCaptureLayersInternal_long, jlong consumeBufferInterfacePtr)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_sc_long, orig_nativeCaptureLayers_sc_long, jlong consumeBufferInterfacePtr)
-
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_obj, orig_nativeCaptureLayers_obj, jobject listener)
-HOOK_SECURE_CAPTURE(jint, hook_nativeCaptureLayers_sc_obj, orig_nativeCaptureLayers_sc_obj, jobject listener)
-
-static jobject hook_nativeCreateDisplay(JNIEnv *env, jclass clazz, jstring name, jboolean secure) {
-    (void)secure;
-    return orig_nativeCreateDisplay(env, clazz, name, JNI_TRUE);
+static jobject h_cd(JNIEnv *e,jclass c,jstring n,jboolean s) {
+    return ocd ? ocd(e,c,n,JNI_TRUE) : NULL;
 }
 
-static jobject hook_nativeCreateVirtualDisplay(JNIEnv *env, jclass clazz, jstring name, jboolean secure) {
-    (void)secure;
-    return orig_nativeCreateVirtualDisplay(env, clazz, name, JNI_TRUE);
+static jobject h_cv(JNIEnv *e,jclass c,jstring n,jboolean s) {
+    return ocv ? ocv(e,c,n,JNI_TRUE) : NULL;
 }
 
-static void hook_nativeSetFlags(JNIEnv *env, jclass clazz, jobject transactionObj, jobject surfaceControlObj, jint flags, jint mask) {
-    jint new_flags = flags & ~SURFACE_SECURE;
-    jint new_mask = mask & ~SURFACE_SECURE;
-    orig_nativeSetFlags(env, clazz, transactionObj, surfaceControlObj, new_flags, new_mask);
+static void h_f(JNIEnv *e,jclass c,jobject t,jobject s,jint f,jint m) {
+    f &= ~SECURE; m &= ~SECURE;
+    if (of) of(e,c,t,s,f,m);
 }
 
-static void hook_nativeSetFlags_old(JNIEnv *env, jclass clazz, jlong nativeObject, jint flags, jint mask) {
-    jint new_flags = flags & ~SURFACE_SECURE;
-    jint new_mask = mask & ~SURFACE_SECURE;
-    orig_nativeSetFlags_old(env, clazz, nativeObject, new_flags, new_mask);
+static void h_fo(JNIEnv *e,jclass c,jlong o,jint f,jint m) {
+    f &= ~SECURE; m &= ~SECURE;
+    if (of_old) of_old(e,c,o,f,m);
 }
 
-#define SAVE_ORIG_PTR(methods, idx, hook_func, orig_var, type) \
-    do { \
-        if (methods[idx].fnPtr != (void*)(hook_func) && methods[idx].fnPtr != NULL) { \
-            orig_var = (type)methods[idx].fnPtr; \
-        } \
-    } while (0)
-
-static void register_hooks(JNIEnv *env) {
-    if (hooks_registered) return;
-    hooks_registered = true;
-
-    // ScreenCapture
-    {
-        JNINativeMethod methods[] = {
-            {"nativeCaptureDisplay", "(Landroid/window/ScreenCapture$DisplayCaptureArgs;J)I", (void*)hook_nativeCaptureDisplay_long},
-            {"nativeCaptureDisplay", "(Landroid/window/ScreenCapture$DisplayCaptureArgs;Landroid/window/ScreenCapture$ScreenCaptureListener;)I", (void*)hook_nativeCaptureDisplay_obj},
-            {"nativeCaptureLayers", "(Landroid/window/ScreenCapture$LayerCaptureArgs;JZ)I", (void*)hook_nativeCaptureLayers_long_sync},
-            {"nativeCaptureLayers", "(Landroid/window/ScreenCapture$LayerCaptureArgs;J)I", (void*)hook_nativeCaptureLayers_long},
-            {"nativeCaptureLayers", "(Landroid/window/ScreenCapture$LayerCaptureArgs;Landroid/window/ScreenCapture$ScreenCaptureListener;)I", (void*)hook_nativeCaptureLayers_obj}
-        };
-
-        // Save original pointers BEFORE hooking
-        SAVE_ORIG_PTR(methods, 0, hook_nativeCaptureDisplay_long, orig_nativeCaptureDisplay_long, nativeCaptureDisplay_long_t);
-        SAVE_ORIG_PTR(methods, 1, hook_nativeCaptureDisplay_obj, orig_nativeCaptureDisplay_obj, nativeCaptureDisplay_obj_t);
-        SAVE_ORIG_PTR(methods, 2, hook_nativeCaptureLayers_long_sync, orig_nativeCaptureLayers_long_sync, nativeCaptureLayers_long_sync_t);
-        SAVE_ORIG_PTR(methods, 3, hook_nativeCaptureLayers_long, orig_nativeCaptureLayers_long, nativeCaptureLayers_long_t);
-        SAVE_ORIG_PTR(methods, 4, hook_nativeCaptureLayers_obj, orig_nativeCaptureLayers_obj, nativeCaptureLayers_obj_t);
-
-        g_api_table->hookJniNativeMethods(env, "android/window/ScreenCapture", methods, sizeof(methods)/sizeof(methods[0]));
-    }
-
-    // ScreenCaptureInternal
-    {
-        JNINativeMethod methods[] = {
-            {"nativeCaptureDisplay", "(Landroid/window/ScreenCaptureInternal$DisplayCaptureArgs;J)I", (void*)hook_nativeCaptureDisplayInternal_long},
-            {"nativeCaptureLayers", "(Landroid/window/ScreenCaptureInternal$LayerCaptureArgs;JZ)I", (void*)hook_nativeCaptureLayersInternal_long_sync},
-            {"nativeCaptureLayers", "(Landroid/window/ScreenCaptureInternal$LayerCaptureArgs;J)I", (void*)hook_nativeCaptureLayersInternal_long}
-        };
-
-        SAVE_ORIG_PTR(methods, 0, hook_nativeCaptureDisplayInternal_long, orig_nativeCaptureDisplayInternal_long, nativeCaptureDisplay_long_t);
-        SAVE_ORIG_PTR(methods, 1, hook_nativeCaptureLayersInternal_long_sync, orig_nativeCaptureLayersInternal_long_sync, nativeCaptureLayers_long_sync_t);
-        SAVE_ORIG_PTR(methods, 2, hook_nativeCaptureLayersInternal_long, orig_nativeCaptureLayersInternal_long, nativeCaptureLayers_long_t);
-
-        g_api_table->hookJniNativeMethods(env, "android/window/ScreenCaptureInternal", methods, sizeof(methods)/sizeof(methods[0]));
-    }
-
-    // SurfaceControl
-    {
-        JNINativeMethod methods[] = {
-            {"nativeCaptureDisplay", "(Landroid/view/SurfaceControl$DisplayCaptureArgs;Landroid/view/SurfaceControl$ScreenCaptureListener;)I", (void*)hook_nativeCaptureDisplay_sc_obj},
-            {"nativeCaptureDisplay", "(Landroid/view/SurfaceControl$DisplayCaptureArgs;J)I", (void*)hook_nativeCaptureDisplay_sc_long},
-            {"nativeCaptureLayers", "(Landroid/view/SurfaceControl$LayerCaptureArgs;Landroid/view/SurfaceControl$ScreenCaptureListener;)I", (void*)hook_nativeCaptureLayers_sc_obj},
-            {"nativeCaptureLayers", "(Landroid/view/SurfaceControl$LayerCaptureArgs;J)I", (void*)hook_nativeCaptureLayers_sc_long},
-            {"nativeCaptureLayers", "(Landroid/view/SurfaceControl$LayerCaptureArgs;JZ)I", (void*)hook_nativeCaptureLayers_sc_long_sync},
-            {"nativeCreateDisplay", "(Ljava/lang/String;Z)Landroid/os/IBinder;", (void*)hook_nativeCreateDisplay},
-            {"nativeSetFlags", "(Landroid/view/SurfaceControl$Transaction;Landroid/view/SurfaceControl;II)V", (void*)hook_nativeSetFlags},
-            {"nativeSetFlags", "(JII)V", (void*)hook_nativeSetFlags_old}
-        };
-
-        SAVE_ORIG_PTR(methods, 0, hook_nativeCaptureDisplay_sc_obj, orig_nativeCaptureDisplay_sc_obj, nativeCaptureDisplay_obj_t);
-        SAVE_ORIG_PTR(methods, 1, hook_nativeCaptureDisplay_sc_long, orig_nativeCaptureDisplay_sc_long, nativeCaptureDisplay_long_t);
-        SAVE_ORIG_PTR(methods, 2, hook_nativeCaptureLayers_sc_obj, orig_nativeCaptureLayers_sc_obj, nativeCaptureLayers_obj_t);
-        SAVE_ORIG_PTR(methods, 3, hook_nativeCaptureLayers_sc_long, orig_nativeCaptureLayers_sc_long, nativeCaptureLayers_long_t);
-        SAVE_ORIG_PTR(methods, 4, hook_nativeCaptureLayers_sc_long_sync, orig_nativeCaptureLayers_sc_long_sync, nativeCaptureLayers_long_sync_t);
-        SAVE_ORIG_PTR(methods, 5, hook_nativeCreateDisplay, orig_nativeCreateDisplay, nativeCreateDisplay_t);
-        SAVE_ORIG_PTR(methods, 6, hook_nativeSetFlags, orig_nativeSetFlags, nativeSetFlags_t);
-        SAVE_ORIG_PTR(methods, 7, hook_nativeSetFlags_old, orig_nativeSetFlags_old, nativeSetFlags_old_t);
-
-        g_api_table->hookJniNativeMethods(env, "android/view/SurfaceControl", methods, sizeof(methods)/sizeof(methods[0]));
-    }
-
-    // DisplayControl
-    {
-        JNINativeMethod methods[] = {
-            {"nativeCreateVirtualDisplay", "(Ljava/lang/String;Z)Landroid/os/IBinder;", (void*)hook_nativeCreateVirtualDisplay}
-        };
-
-        SAVE_ORIG_PTR(methods, 0, hook_nativeCreateVirtualDisplay, orig_nativeCreateVirtualDisplay, nativeCreateVirtualDisplay_t);
-
-        g_api_table->hookJniNativeMethods(env, "com/android/server/display/DisplayControl", methods, sizeof(methods)/sizeof(methods[0]));
-    }
-
-    // SurfaceControl$Transaction
-    {
-        JNINativeMethod methods[] = {
-            {"nativeSetFlags", "(JJII)V", (void*)hook_nativeSetFlags}
-        };
-
-        SAVE_ORIG_PTR(methods, 0, hook_nativeSetFlags, orig_nativeSetFlags, nativeSetFlags_t);
-
-        g_api_table->hookJniNativeMethods(env, "android/view/SurfaceControl$Transaction", methods, sizeof(methods)/sizeof(methods[0]));
-    }
+static void h_ft(JNIEnv *e,jclass c,jlong t,jlong s,jint f,jint m) {
+    f &= ~SECURE; m &= ~SECURE;
+    if (oft) oft(e,c,t,s,f,m);
 }
 
-static void my_preAppSpecialize(void *impl, struct zygisk_app_specialize_args *args) {
-    (void)impl;
-    JNIEnv *env = get_env();
-    if (env != NULL) {
-        // Extract package name for targeted FLAG_SECURE modification
-        if (args->nice_name != NULL && *(args->nice_name) != NULL) {
-            jstring nice_name_jstr = *(args->nice_name);
-            const char *nice_name = (*env)->GetStringUTFChars(env, nice_name_jstr, NULL);
-            if (nice_name != NULL) {
-                size_t name_len = strlen(nice_name);
-                if (name_len >= sizeof(g_target_package)) {
-                    name_len = sizeof(g_target_package) - 1;
-                }
-                memcpy(g_target_package, nice_name, name_len);
-                g_target_package[name_len] = '\0';
-                g_target_package_set = true;
-                (*env)->ReleaseStringUTFChars(env, nice_name_jstr, nice_name);
-            }
-        }
-        register_hooks(env);
-    }
+#define SAVE(m,i,o,t) ((o)=(t)(m)[i].fnPtr)
+
+static jfieldID fid(JNIEnv *e,const char *c,const char *n,const char *s) {
+    jclass k = (*e)->FindClass(e,c);
+    if (!k) { (*e)->ExceptionClear(e); return NULL; }
+
+    jfieldID f = (*e)->GetFieldID(e,k,n,s);
+    if (!f) (*e)->ExceptionClear(e);
+
+    (*e)->DeleteLocalRef(e,k);
+    return f;
 }
 
-static void my_postAppSpecialize(void *impl, const struct zygisk_app_specialize_args *args) {
-    (void)impl; (void)args;
+static void hooks(JNIEnv *e) {
+    if (registered || !api) return;
+
+    d_policy = fid(e,"android/window/ScreenCapture$DisplayCaptureArgs",
+                   "mSecureContentPolicy","I");
+    d_layers = fid(e,"android/window/ScreenCapture$DisplayCaptureArgs",
+                   "mCaptureSecureLayers","Z");
+
+    l_policy = fid(e,"android/window/ScreenCapture$LayerCaptureArgs",
+                   "mSecureContentPolicy","I");
+    l_layers = fid(e,"android/window/ScreenCapture$LayerCaptureArgs",
+                   "mCaptureSecureLayers","Z");
+
+    sd_policy = fid(e,"android/view/SurfaceControl$DisplayCaptureArgs",
+                    "mSecureContentPolicy","I");
+    sd_layers = fid(e,"android/view/SurfaceControl$DisplayCaptureArgs",
+                    "mCaptureSecureLayers","Z");
+
+    JNINativeMethod a[] = {
+        {"nativeCaptureDisplay","(Landroid/window/ScreenCapture$DisplayCaptureArgs;J)I",(void*)h_d},
+        {"nativeCaptureDisplay","(Landroid/window/ScreenCapture$DisplayCaptureArgs;Landroid/window/ScreenCapture$ScreenCaptureListener;)I",(void*)h_do},
+        {"nativeCaptureLayers","(Landroid/window/ScreenCapture$LayerCaptureArgs;JZ)I",(void*)h_s},
+        {"nativeCaptureLayers","(Landroid/window/ScreenCapture$LayerCaptureArgs;J)I",(void*)h_l},
+        {"nativeCaptureLayers","(Landroid/window/ScreenCapture$LayerCaptureArgs;Landroid/window/ScreenCapture$ScreenCaptureListener;)I",(void*)h_lo}
+    };
+
+    api->hookJniNativeMethods(e,"android/window/ScreenCapture",a,N(a));
+    SAVE(a,0,od,cap_d); SAVE(a,1,oo,cap_o);
+    SAVE(a,2,os,cap_s); SAVE(a,3,ol,cap_d); SAVE(a,4,olo,cap_o);
+
+    JNINativeMethod b[] = {
+        {"nativeCaptureDisplay","(Landroid/window/ScreenCaptureInternal$DisplayCaptureArgs;J)I",(void*)h_di},
+        {"nativeCaptureLayers","(Landroid/window/ScreenCaptureInternal$LayerCaptureArgs;JZ)I",(void*)h_si},
+        {"nativeCaptureLayers","(Landroid/window/ScreenCaptureInternal$LayerCaptureArgs;J)I",(void*)h_li}
+    };
+
+    api->hookJniNativeMethods(e,"android/window/ScreenCaptureInternal",b,N(b));
+    SAVE(b,0,odi,cap_d); SAVE(b,1,osi,cap_s); SAVE(b,2,oli,cap_d);
+
+    JNINativeMethod c[] = {
+        {"nativeCaptureDisplay","(Landroid/view/SurfaceControl$DisplayCaptureArgs;Landroid/view/SurfaceControl$ScreenCaptureListener;)I",(void*)h_dso},
+        {"nativeCaptureDisplay","(Landroid/view/SurfaceControl$DisplayCaptureArgs;J)I",(void*)h_ds},
+        {"nativeCaptureLayers","(Landroid/view/SurfaceControl$LayerCaptureArgs;Landroid/view/SurfaceControl$ScreenCaptureListener;)I",(void*)h_lso},
+        {"nativeCaptureLayers","(Landroid/view/SurfaceControl$LayerCaptureArgs;J)I",(void*)h_ls},
+        {"nativeCaptureLayers","(Landroid/view/SurfaceControl$LayerCaptureArgs;JZ)I",(void*)h_ss},
+        {"nativeCreateDisplay","(Ljava/lang/String;Z)Landroid/os/IBinder;",(void*)h_cd},
+        {"nativeSetFlags","(Landroid/view/SurfaceControl$Transaction;Landroid/view/SurfaceControl;II)V",(void*)h_f},
+        {"nativeSetFlags","(JII)V",(void*)h_fo}
+    };
+
+    api->hookJniNativeMethods(e,"android/view/SurfaceControl",c,N(c));
+    SAVE(c,0,oo_sc,cap_o); SAVE(c,1,od_sc,cap_d);
+    SAVE(c,2,olo_sc,cap_o); SAVE(c,3,ol_sc,cap_d);
+    SAVE(c,4,os_sc,cap_s); SAVE(c,5,ocd,create_d);
+    SAVE(c,6,of,flags); SAVE(c,7,of_old,flags_j);
+
+    JNINativeMethod d[] = {
+        {"nativeCreateVirtualDisplay","(Ljava/lang/String;Z)Landroid/os/IBinder;",(void*)h_cv}
+    };
+    api->hookJniNativeMethods(
+        e,"com/android/server/display/DisplayControl",d,N(d));
+    SAVE(d,0,ocv,create_d);
+
+    JNINativeMethod t[] = {
+        {"nativeSetFlags","(JJII)V",(void*)h_ft}
+    };
+    api->hookJniNativeMethods(
+        e,"android/view/SurfaceControl$Transaction",t,N(t));
+    SAVE(t,0,oft,flags_t);
+
+    registered = true;
 }
 
-static void my_preServerSpecialize(void *impl, struct zygisk_server_specialize_args *args) {
-    (void)impl; (void)args;
-    JNIEnv *env = get_env();
-    if (env != NULL) {
-        register_hooks(env);
-    }
+static void pre_app(void *i,struct zygisk_app_specialize_args *a) {
+    (void)i; (void)a;
+    if (env) hooks(env);
 }
 
-// Removed empty my_postServerSpecialize - zygisk accepts NULL for unused callbacks
+static void pre_server(void *i,struct zygisk_server_specialize_args *a) {
+    (void)i; (void)a;
+    if (env) hooks(env);
+}
 
-static struct zygisk_module_abi module_abi = {
+static struct zygisk_module_abi abi = {
     .api_version = ZYGISK_API_VERSION,
     .impl = NULL,
-    .preAppSpecialize = my_preAppSpecialize,
-    .postAppSpecialize = my_postAppSpecialize,
-    .preServerSpecialize = my_preServerSpecialize,
+    .preAppSpecialize = pre_app,
+    .postAppSpecialize = NULL,
+    .preServerSpecialize = pre_server,
     .postServerSpecialize = NULL
 };
 
-__attribute__((visibility("default"))) void zygisk_module_entry(struct zygisk_api_table *table, JNIEnv *env) {
-    g_api_table = table;
-    (*env)->GetJavaVM(env, &g_jvm);
-    table->registerModule(table, &module_abi);
+__attribute__((visibility("default")))
+void zygisk_module_entry(struct zygisk_api_table *t,JNIEnv *e) {
+    if (!t || !e || !t->registerModule) return;
+    api = t;
+    env = e;
+    t->registerModule(t,&abi);
 }
