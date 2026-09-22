@@ -41,27 +41,33 @@ static void secure(JNIEnv *e, jobject o, jfieldID policy, jfieldID layers) {
         (*e)->ExceptionClear(e);
 }
 
-#define CAP(name, orig, p, l, ...)                              \
-static jint name(JNIEnv *e,jclass c,jobject a,##__VA_ARGS__) { \
-    secure(e,a,p,l);                                            \
-    return orig ? orig(e,c,a,##__VA_ARGS__) : JNI_ERR;         \
+#define CAP(name, orig, p, l, t)                       \
+static jint name(JNIEnv *e,jclass c,jobject a,t x) {   \
+    secure(e,a,p,l);                                   \
+    return orig ? orig(e,c,a,x) : JNI_ERR;             \
 }
 
-CAP(h_d,   od,    d_policy,d_layers,jlong x)
-CAP(h_di,  odi,   l_policy,l_layers,jlong x)
-CAP(h_ds,  od_sc, sd_policy,sd_layers,jlong x)
-CAP(h_do,  oo,    d_policy,d_layers,jobject x)
-CAP(h_dso, oo_sc, sd_policy,sd_layers,jobject x)
+#define CAPS(name, orig, p, l, t)                             \
+static jint name(JNIEnv *e,jclass c,jobject a,t x,jboolean s) { \
+    secure(e,a,p,l);                                           \
+    return orig ? orig(e,c,a,x,s) : JNI_ERR;                   \
+}
 
-CAP(h_l,   ol,    d_policy,d_layers,jlong x)
-CAP(h_li,  oli,   l_policy,l_layers,jlong x)
-CAP(h_ls,  ol_sc, sd_policy,sd_layers,jlong x)
-CAP(h_lo,  olo,   d_policy,d_layers,jobject x)
-CAP(h_lso, olo_sc, sd_policy,sd_layers,jobject x)
+CAP(h_d,   od,    d_policy,d_layers,jlong)
+CAP(h_di,  odi,   l_policy,l_layers,jlong)
+CAP(h_ds,  od_sc, sd_policy,sd_layers,jlong)
+CAP(h_do,  oo,    d_policy,d_layers,jobject)
+CAP(h_dso, oo_sc, sd_policy,sd_layers,jobject)
 
-CAP(h_s,   os,    d_policy,d_layers,jlong x,jboolean s)
-CAP(h_si,  osi,   l_policy,l_layers,jlong x,jboolean s)
-CAP(h_ss,  os_sc, sd_policy,sd_layers,jlong x,jboolean s)
+CAP(h_l,   ol,    d_policy,d_layers,jlong)
+CAP(h_li,  oli,   l_policy,l_layers,jlong)
+CAP(h_ls,  ol_sc, sd_policy,sd_layers,jlong)
+CAP(h_lo,  olo,   d_policy,d_layers,jobject)
+CAP(h_lso, olo_sc, sd_policy,sd_layers,jobject)
+
+CAPS(h_s,   os,    d_policy,d_layers,jlong)
+CAPS(h_si,  osi,   l_policy,l_layers,jlong)
+CAPS(h_ss,  os_sc, sd_policy,sd_layers,jlong)
 
 static jobject h_cd(JNIEnv *e,jclass c,jstring n,jboolean s) {
     return ocd ? ocd(e,c,n,JNI_TRUE) : NULL;
