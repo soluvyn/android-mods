@@ -1,0 +1,6 @@
+id=unveil
+name=Unveil
+version=v0.2.1
+versionCode=021
+author=Ayne (soluvyn)
+description=Disable FLAG_SECURE natively.

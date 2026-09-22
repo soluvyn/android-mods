@@ -1,0 +1,98 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build Modules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        module:
+          - name: pixie
+            path: pixie
+            src: pixie.c
+            module_prop: module/module.prop
+          - name: unveil
+            path: unveil
+            src: unveil.c
+            module_prop: module.prop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-ndk@v2
+        with:
+          ndk-version: r26d
+
+      - name: Build ${{ matrix.module.name }}
+        working-directory: ${{ matrix.module.path }}
+        env:
+          NDK: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          CC="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          CFLAGS="-shared -Os -s -fvisibility=hidden -std=c11"
+          
+          # Extract version from module.prop
+          VERSION=$(sed -n 's/^version=//p' ${{ matrix.module.module_prop }})
+          ZIP="${{ matrix.module.name }}-${VERSION}.zip"
+          
+          if [ "${{ matrix.module.name }}" = "pixie" ]; then
+            SO="module/zygisk/arm64-v8a.so"
+          else
+            SO="zygisk/arm64-v8a.so"
+          fi
+          
+          mkdir -p $(dirname "$SO")
+          $CC $CFLAGS -o "$SO" ${{ matrix.module.src }}
+          
+          if [ "${{ matrix.module.name }}" = "pixie" ]; then
+            cd module && zip -9 -Z deflate -r "../$ZIP" module.prop system zygisk && cd ..
+          else
+            zip -9 -Z deflate -r "$ZIP" module.prop zygisk
+          fi
+          
+          echo "ZIP_PATH=${{ matrix.module.path }}/$ZIP" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module.name }}-${{ env.VERSION }}
+          path: ${{ matrix.module.path }}/${{ matrix.module.name }}-${{ env.VERSION }}.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          files: |
+            artifacts/pixie-*/*.zip
+            artifacts/unveil-*/*.zip
+          generate_release_notes: true
