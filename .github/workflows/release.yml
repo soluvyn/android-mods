@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     strategy:
       matrix:
         module:
@@ -24,48 +25,55 @@ jobs:
             path: pixie
             src: pixie.c
             module_prop: module/module.prop
+
           - name: unveil
             path: unveil
             src: unveil.c
             module_prop: module.prop
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
-        uses: android-actions/setup-ndk@v2
-        with:
-          ndk-version: r26d
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;26.3.11579264"
 
       - name: Build ${{ matrix.module.name }}
         working-directory: ${{ matrix.module.path }}
         env:
-          NDK: ${{ env.ANDROID_NDK_HOME }}
+          NDK: ${{ ANDROID_HOME }}/ndk/26.3.11579264
         run: |
+          set -e
+
           CC="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
           CFLAGS="-shared -Os -s -fvisibility=hidden -std=c11"
-          
+
           # Extract version from module.prop
-          VERSION=$(sed -n 's/^version=//p' ${{ matrix.module.module_prop }})
+          VERSION=$(sed -n 's/^version=//p' "${{ matrix.module.module_prop }}")
           ZIP="${{ matrix.module.name }}-${VERSION}.zip"
-          
+
           if [ "${{ matrix.module.name }}" = "pixie" ]; then
             SO="module/zygisk/arm64-v8a.so"
           else
             SO="zygisk/arm64-v8a.so"
           fi
-          
-          mkdir -p $(dirname "$SO")
-          $CC $CFLAGS -o "$SO" ${{ matrix.module.src }}
-          
+
+          mkdir -p "$(dirname "$SO")"
+
+          "$CC" $CFLAGS -o "$SO" "${{ matrix.module.src }}"
+
           if [ "${{ matrix.module.name }}" = "pixie" ]; then
-            cd module && zip -9 -Z deflate -r "../$ZIP" module.prop system zygisk && cd ..
+            cd module
+            zip -9 -Z deflate -r "../$ZIP" module.prop system zygisk
+            cd ..
           else
             zip -9 -Z deflate -r "$ZIP" module.prop zygisk
           fi
-          
-          echo "ZIP_PATH=${{ matrix.module.path }}/$ZIP" >> $GITHUB_ENV
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -79,6 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
