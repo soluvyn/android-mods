@@ -1,104 +1,72 @@
-#include <jni.h>
-#include <stdbool.h>
 #include <string.h>
-
 #include "zygisk.h"
 
-#define PHOTOS_PACKAGE "com.google.android.apps.photos"
+#define PHOTOS "com.google.android.apps.photos"
 
-static JNIEnv *g_env;
-static struct zygisk_api_table *g_api;
-static bool g_should_inject;
+static JNIEnv *env;
+static struct zygisk_api_table *api;
+static bool inject;
 
-static void set_static_string(JNIEnv *env, jclass clazz,
-                              const char *field, const char *value) {
-    jfieldID id = (*env)->GetStaticFieldID(
-        env, clazz, field, "Ljava/lang/String;"
-    );
-
-    if (id == NULL) {
-        (*env)->ExceptionClear(env);
-        return;
+static void set_string(jclass build, const char *field, const char *value) {
+    jfieldID id = (*env)->GetStaticFieldID(env, build, field, "Ljava/lang/String;");
+    if (id) {
+        jstring str = (*env)->NewStringUTF(env, value);
+        if (str) {
+            (*env)->SetStaticObjectField(env, build, id, str);
+            (*env)->DeleteLocalRef(env, str);
+        }
     }
-
-    jstring str = (*env)->NewStringUTF(env, value);
-    if (str == NULL) {
-        (*env)->ExceptionClear(env);
-        return;
-    }
-
-    (*env)->SetStaticObjectField(env, clazz, id, str);
     (*env)->ExceptionClear(env);
-    (*env)->DeleteLocalRef(env, str);
 }
 
-static void preAppSpecialize(void *impl,
-                             struct zygisk_app_specialize_args *args) {
+static void pre(void *impl, struct zygisk_app_specialize_args *args) {
     (void)impl;
+    inject = false;
 
-    g_should_inject = false;
+    if (args && args->nice_name && *args->nice_name) {
+        const char *name = (*env)->GetStringUTFChars(env, *args->nice_name, NULL);
+        if (name) {
+            inject = strcmp(name, PHOTOS) == 0;
+            (*env)->ReleaseStringUTFChars(env, *args->nice_name, name);
+        }
+    }
 
-    if (args == NULL || args->nice_name == NULL || *(args->nice_name) == NULL)
-        return;
-
-    jstring name = *(args->nice_name);
-    const char *process = (*g_env)->GetStringUTFChars(g_env, name, NULL);
-
-    if (process == NULL)
-        return;
-
-    g_should_inject = strcmp(process, PHOTOS_PACKAGE) == 0;
-
-    (*g_env)->ReleaseStringUTFChars(g_env, name, process);
-
-    if (g_api != NULL && g_api->setOption != NULL)
-        g_api->setOption(g_api->impl, ZYGISK_DLCLOSE_MODULE_LIBRARY);
+    if (!inject)
+        api->setOption(api->impl, ZYGISK_DLCLOSE_MODULE_LIBRARY);
 }
 
-static void postAppSpecialize(
-    void *impl,
-    const struct zygisk_app_specialize_args *args) {
+static void post(void *impl, const struct zygisk_app_specialize_args *args) {
     (void)impl;
     (void)args;
-
-    if (!g_should_inject || g_env == NULL)
+    if (!inject)
         return;
 
-    jclass build = (*g_env)->FindClass(g_env, "android/os/Build");
-    if (build == NULL) {
-        (*g_env)->ExceptionClear(g_env);
+    jclass build = (*env)->FindClass(env, "android/os/Build");
+    if (!build) {
+        (*env)->ExceptionClear(env);
         return;
     }
 
-    set_static_string(g_env, build, "BRAND", "google");
-    set_static_string(g_env, build, "MANUFACTURER", "Google");
-    set_static_string(g_env, build, "MODEL", "Pixel XL");
-    set_static_string(
-        g_env,
-        build,
-        "FINGERPRINT",
-        "google/marlin/marlin:10/QP1A.191005.007.A3/5972272:user/release-keys"
-    );
+    set_string(build, "BRAND", "google");
+    set_string(build, "MANUFACTURER", "Google");
+    set_string(build, "MODEL", "Pixel XL");
+    set_string(build, "FINGERPRINT",
+               "google/marlin/marlin:10/QP1A.191005.007.A3/5972272:user/release-keys");
 
-    (*g_env)->DeleteLocalRef(g_env, build);
+    (*env)->DeleteLocalRef(env, build);
 }
 
-static struct zygisk_module_abi g_abi = {
+static struct zygisk_module_abi abi = {
     .api_version = ZYGISK_API_VERSION,
-    .impl = NULL,
-    .preAppSpecialize = preAppSpecialize,
-    .postAppSpecialize = postAppSpecialize,
-    .preServerSpecialize = NULL,
-    .postServerSpecialize = NULL
+    .preAppSpecialize = pre,
+    .postAppSpecialize = post,
 };
 
 __attribute__((visibility("default")))
-void zygisk_module_entry(struct zygisk_api_table *table, JNIEnv *env) {
-    if (table == NULL || env == NULL)
-        return;
-
-    g_api = table;
-    g_env = env;
-
-    table->registerModule(table, &g_abi);
+void zygisk_module_entry(struct zygisk_api_table *table, JNIEnv *e) {
+    if (table && e) {
+        api = table;
+        env = e;
+        table->registerModule(table, &abi);
+    }
 }
